@@ -1,0 +1,3 @@
+Only generate the precise function(s) asked for, and helper functions as needed. Do NOT implement features that have not been specifically requested at this moment, even if those features are mentioned in prd.md.
+All function signatures should be type annotated, and all functions should have docstrings.
+NEVER rewrite entire files! Use your diff edit tool instead. If the user wants to rewrite a file, they will manually clear it or ask you to make a copy with certain changes (and then manually overwrite the file with the copy).

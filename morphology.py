@@ -1,0 +1,396 @@
+import numpy as np
+from lxml import etree
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict
+from setup_logger import logger
+
+@dataclass
+class Joint:
+    name: str
+    axis: np.ndarray
+    range: Tuple[float, float] = (-1.57, 1.57)
+    type: str = "hinge"
+
+@dataclass
+class Link:
+    name: str
+    length: float
+    radius: float
+    child: Optional['Link'] = None
+    joint: Optional[Joint] = None
+
+def random_unit_vector():
+    v = np.random.normal(size=3)
+    return v / np.linalg.norm(v)
+
+def random_rotation_quat():
+    axis = random_unit_vector()
+    angle = np.random.uniform(0, 2 * np.pi)
+    s = np.sin(angle / 2)
+    return [axis[0]*s, axis[1]*s, axis[2]*s, np.cos(angle/2)]
+
+class Morphology:
+    # Class attributes for morphology parameters
+    num_links_range = (3, 7)  # Range for number of links in the chain
+    radius_range = (0.01, 0.03)
+    length_range = (0.1, 0.3)
+
+    def __init__(self, params=None):
+        if params is None:
+            # Default parameters for random generation
+            self.params = {}
+            self._generate_random_morphology()
+        else:
+            self.params = params
+            if 'links' in params:
+                self._load_morphology(params['links'])
+            else:
+                self._generate_random_morphology()
+
+    def _generate_random_morphology(self):
+        """Generate a random morphology using the current parameters."""
+        self.base = Link(
+            name="base",
+            length=0,
+            radius=0
+        )
+        
+        current_link = self.base
+        num_links = np.random.randint(*self.num_links_range)
+        for i in range(num_links):
+            length = np.random.uniform(*self.length_range)
+            radius = np.random.uniform(*self.radius_range)
+            
+            # Create joint and link
+            joint = Joint(
+                name=f"j_link_{i}",
+                axis=random_unit_vector()
+            )
+            
+            new_link = Link(
+                name=f"link_{i}",
+                length=length,
+                radius=radius,
+                joint=joint
+            )
+            
+            current_link.child = new_link
+            current_link = new_link
+
+    def _load_morphology(self, links_data: Dict):
+        """Load a saved morphology from the provided data."""
+        def create_link_from_dict(data: Dict) -> Link:
+            link = Link(
+                name=data['name'],
+                length=data['length'],
+                radius=data['radius']
+            )
+            
+            if 'joint' in data:
+                joint_data = data['joint']
+                link.joint = Joint(
+                    name=joint_data['name'],
+                    axis=np.array(joint_data['axis']),
+                    range=tuple(joint_data.get('range', (-1.57, 1.57))),
+                    type=joint_data.get('type', 'hinge')
+                )
+            
+            if 'child' in data:
+                link.child = create_link_from_dict(data['child'])
+            
+            return link
+        
+        self.base = create_link_from_dict(links_data)
+    
+    def _get_links_chain(self, start_link: Link) -> List[Link]:
+        """Get a list of all links in the chain starting from the given link."""
+        links = [start_link]
+        current = start_link
+        while current.child:
+            links.append(current.child)
+            current = current.child
+        return links
+
+    def to_mjcf(self) -> str:
+        """Convert the morphology to MJCF format string."""
+        def add_link_to_mujoco(parent_elem, link: Link, color_idx=0):
+            """
+            Add a link to the MuJoCo model.
+            
+            In MuJoCo, the kinematic chain works as follows:
+            1. Each body is positioned relative to its parent
+            2. Joints connect a child body to its parent
+            3. The joint is located at the child body's origin
+            4. When a joint rotates, it rotates the child body and all its descendants
+            
+            For a proper kinematic chain:
+            - The base link is attached directly to the worldbody
+            - Each child link is attached to its parent with a joint at the child's origin
+            - Each link's geometry extends from its origin (where the joint is)
+            """
+            
+            if link.name == "base":
+                # Base link is the worldbody
+                body = parent_elem
+            else:
+                # Create a new body for this link
+                # For a proper kinematic chain in MuJoCo:
+                # - Each child body should be positioned at the end of its parent's geometry
+                # - The joint is at the child body's origin
+                # - The child's geometry extends from its origin
+                pos = [0, 0, 0]  # Default position relative to parent
+                
+                # If this is not the first link after base, position it at the end of the parent link
+                if parent_elem.tag != "worldbody":
+                    pos = [0, 0, parent_elem.find(".//geom").get("fromto").split()[-3:]]
+                    pos = [0, 0, float(parent_elem.find(".//geom").get("fromto").split()[-1])]
+                
+                body = etree.SubElement(parent_elem, "body", name=link.name, pos=" ".join(map(str, pos)))
+                
+                # Add joint at the body's origin
+                if link.joint:
+                    axis_str = " ".join(map(str, link.joint.axis))
+                    etree.SubElement(
+                        body,
+                        "joint",
+                        name=link.joint.name,
+                        type=link.joint.type,
+                        axis=axis_str,
+                        limited="true",
+                        range=f"{link.joint.range[0]} {link.joint.range[1]}"
+                    )
+                
+                # Add geometry for this link
+                if link.length > 0:
+                    # Define ROYGBV colors
+                    colors = [
+                        "1 0 0 1",  # Red
+                        "1 0.5 0 1",  # Orange
+                        "1 1 0 1",  # Yellow
+                        "0 1 0 1",  # Green
+                        "0 0 1 1",  # Blue
+                        "0.5 0 0.5 1"  # Violet
+                    ]
+                    color = colors[color_idx % len(colors)]
+                    
+                    # The capsule extends from the joint (0,0,0) along the z-axis
+                    fromto_str = f"0 0 0 0 0 {link.length}"
+                    
+                    logger.debug(f"  Creating capsule for {link.name}:")
+                    logger.debug(f"    fromto: {fromto_str}")
+                    logger.debug(f"    radius: {link.radius}")
+                    etree.SubElement(
+                        body,
+                        "geom",
+                        type="capsule",
+                        fromto=fromto_str,
+                        size=str(link.radius),
+                        rgba=color
+                    )
+            
+            # Add child if it exists
+            if link.child:
+                add_link_to_mujoco(body, link.child, color_idx=color_idx + 1)
+
+        # Create MJCF structure
+        mujoco = etree.Element("mujoco", model="morphology")
+        etree.SubElement(mujoco, "compiler", angle="radian", coordinate="local")
+        worldbody = etree.SubElement(mujoco, "worldbody")
+        
+        # Add the morphology tree
+        add_link_to_mujoco(worldbody, self.base)
+        
+        # Add actuators for all joints
+        actuator_elem = etree.SubElement(mujoco, "actuator")
+        
+        # Collect all joints from the morphology tree
+        links_chain = self._get_links_chain(self.base)
+        for link in links_chain[1:]:
+            if link.joint:
+                etree.SubElement(
+                    actuator_elem,
+                    "motor",
+                    name=f"motor_{link.joint.name}",
+                    joint=link.joint.name,
+                    gear="1"
+                )
+                logger.debug(f"Added actuator for joint: {link.joint.name}")
+        
+        return etree.tostring(mujoco, pretty_print=True).decode("utf-8")
+
+    def get_params(self) -> Dict:
+        """Get the current parameters of the morphology."""
+        return self.params.copy()
+
+    def to_dict(self) -> Dict:
+        """Convert the morphology to a dictionary representation."""
+        def link_to_dict(link: Link) -> Dict:
+            data = {
+                'name': link.name,
+                'length': link.length,
+                'radius': link.radius,
+            }
+            
+            if link.joint:
+                data['joint'] = {
+                    'name': link.joint.name,
+                    'axis': link.joint.axis.tolist(),
+                    'range': link.joint.range,
+                    'type': link.joint.type
+                }
+            
+            if link.child:
+                data['child'] = link_to_dict(link.child)
+            
+            return data
+        
+        return {
+            'links': link_to_dict(self.base),
+            **self.params
+        }
+
+def test_fk(num_timesteps: int = 100, control_magnitude: float = 0.1) -> np.ndarray:
+    """
+    Generate a random morphology, add small control values, simulate its dynamics,
+    and return the end effector position.
+    
+    Args:
+        num_timesteps: Number of simulation timesteps to run
+        control_magnitude: Magnitude of the random control values
+        
+    Returns:
+        np.ndarray: The 3D position of the end effector after simulation
+    """
+    import mujoco
+    
+    # Generate random morphology
+    logger.info("Generating random morphology for forward kinematics test")
+    morphology = Morphology()
+    
+    # Print the structure for debugging
+    logger.info("Morphology structure:")
+    
+    def print_link_structure(link, depth=0):
+        indent = "  " * depth
+        if link.name != "base":
+            logger.info(f"{indent}- {link.name}: length={link.length}, radius={link.radius}")
+        if link.child:
+            print_link_structure(link.child, depth + 1)
+    
+    print_link_structure(morphology.base)
+    
+    # Get the last link (end effector)
+    links_chain = morphology._get_links_chain(morphology.base)
+    end_effector = links_chain[-1]
+    logger.info(f"End effector: {end_effector.name}")
+    
+    # Convert to MJCF
+    logger.info("Converting to MJCF")
+    mjcf_str = morphology.to_mjcf()
+    
+    # Create MuJoCo model
+    logger.info("Creating MuJoCo model")
+    model = mujoco.MjModel.from_xml_string(mjcf_str)
+    data = mujoco.MjData(model)
+    
+    # Actuators should already be in the model from to_mjcf()
+    logger.info(f"Model has {model.nu} actuators")
+    
+    # Set small random control values
+    logger.info(f"Setting small random control values (magnitude: {control_magnitude}) for {model.nu} actuators")
+    for i in range(model.nu):
+        data.ctrl[i] = np.random.uniform(-control_magnitude, control_magnitude)
+    
+    # Run simulation for specified number of timesteps
+    logger.info(f"Running simulation for {num_timesteps} timesteps")
+    for _ in range(num_timesteps):
+        mujoco.mj_step(model, data)
+    
+    # Get the end effector position
+    # Find the body ID for the end effector
+    end_effector_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, end_effector.name)
+    end_effector_pos = data.xpos[end_effector_id].copy()
+    
+    logger.info(f"End effector position after simulation: {end_effector_pos}")
+    
+    return end_effector_pos
+
+def test_vis():
+    """Generate a random morphology and visualize it in MuJoCo."""
+    import mujoco
+    import mujoco.viewer
+    
+    # Generate random morphology
+    logger.info("Generating random morphology")
+    morphology = Morphology()
+    
+    # Print the structure for debugging
+    logger.info("Morphology structure:")
+    
+    def print_link_structure(link, depth=0):
+        indent = "  " * depth
+        if link.name != "base":
+            logger.info(f"{indent}- {link.name}: length={link.length}, radius={link.radius}")
+        if link.child:
+            print_link_structure(link.child, depth + 1)
+    
+    print_link_structure(morphology.base)
+    
+    # Convert to MJCF
+    logger.info("Converting to MJCF")
+    mjcf_str = morphology.to_mjcf()
+    
+    # Create MuJoCo model
+    logger.info("Creating MuJoCo model")
+    model = mujoco.MjModel.from_xml_string(mjcf_str)
+    data = mujoco.MjData(model)
+    
+    # Initialize control values for joints
+    if model.nu > 0:  # Check if there are any actuators/controls
+        logger.info(f"Setting initial control values for {model.nu} joints")
+        # Set small sinusoidal control values based on joint index
+        for i in range(model.nu):
+            # Different frequencies and phases for varied movement
+            data.ctrl[i] = 0.3 * np.sin(i * 0.7)
+    else:
+        logger.info(f"Setting initial control values for {model.nu} joints")
+        for i in range(model.nu):
+            data.ctrl[i] = 0.3 * np.sin(i * 0.7)
+    
+    # Visualize
+    with mujoco.viewer.launch_passive(model=model, data=data) as viewer:
+        # Set camera position for better view
+        viewer.cam.distance = 2.0
+        viewer.cam.azimuth = 45
+        viewer.cam.elevation = -30
+        
+        # Run simulation for a few seconds
+        sim_time = 0.0
+        while viewer.is_running():
+            step_start = data.time
+            
+            # Update control values over time for continuous movement
+            for i in range(model.nu):
+                # Create oscillating control values with different frequencies
+                data.ctrl[i] = 0.3 * np.sin(sim_time * 2.0 + i * 0.7)
+            
+            # Step the simulation
+            mujoco.mj_step(model, data)
+            
+            # Update viewer
+            viewer.sync()
+            
+            # Update simulation time
+            sim_time += model.opt.timestep
+
+            import time
+            time.sleep(0.2)
+            
+            # Break after 10 seconds
+            if data.time > 10.0:
+                logger.info("Exit success")
+                break
+
+if __name__ == "__main__":
+    # test_vis()
+    print(test_fk())
