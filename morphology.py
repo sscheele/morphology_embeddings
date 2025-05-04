@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 from setup_logger import logger
 
+import mujoco
+import mujoco.viewer
+
 @dataclass
 class Joint:
     name: str
@@ -214,7 +217,6 @@ class Morphology:
                     joint=link.joint.name,
                     gear="1"
                 )
-                logger.debug(f"Added actuator for joint: {link.joint.name}")
         
         return etree.tostring(mujoco, pretty_print=True).decode("utf-8")
 
@@ -249,6 +251,48 @@ class Morphology:
             **self.params
         }
 
+def quat2mat(quat):
+    """Convert quaternion to rotation matrix."""
+    w, x, y, z = quat
+    return np.array([
+        [1 - 2*y*y - 2*z*z, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
+        [2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z, 2*y*z - 2*x*w],
+        [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
+    ])
+
+def mujoco_fk(data, model, link):
+    """
+    Calculate the tip position of a link using forward kinematics.
+    
+    Args:
+        data: MuJoCo data object
+        model: MuJoCo model object
+        link: Link object
+        
+    Returns:
+        np.ndarray: 3D position of the tip of the link
+    """
+    # Get the link's body ID and root position
+    link_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, link.name)
+    link_root_pos = data.xpos[link_id].copy()
+    
+    # Get the link's orientation as a quaternion
+    link_quat = data.xquat[link_id].copy()
+    
+    # Calculate the tip position by adding the link's length along the z-axis
+    rot_mat = quat2mat(link_quat)
+    z_axis = rot_mat[:, 2]  # Third column is the z-axis
+    tip_pos = link_root_pos + z_axis * link.length
+    
+    return tip_pos
+
+def print_link_structure(link, depth=0):
+    indent = "  " * depth
+    if link.name != "base":
+        logger.info(f"{indent}- {link.name}: length={link.length}, radius={link.radius}")
+    if link.child:
+        print_link_structure(link.child, depth + 1)
+
 def test_fk(num_timesteps: int = 100, control_magnitude: float = 0.1) -> np.ndarray:
     """
     Generate a random morphology, add small control values, simulate its dynamics,
@@ -269,14 +313,6 @@ def test_fk(num_timesteps: int = 100, control_magnitude: float = 0.1) -> np.ndar
     
     # Print the structure for debugging
     logger.info("Morphology structure:")
-    
-    def print_link_structure(link, depth=0):
-        indent = "  " * depth
-        if link.name != "base":
-            logger.info(f"{indent}- {link.name}: length={link.length}, radius={link.radius}")
-        if link.child:
-            print_link_structure(link.child, depth + 1)
-    
     print_link_structure(morphology.base)
     
     # Get the last link (end effector)
@@ -317,23 +353,12 @@ def test_fk(num_timesteps: int = 100, control_magnitude: float = 0.1) -> np.ndar
 
 def test_vis():
     """Generate a random morphology and visualize it in MuJoCo."""
-    import mujoco
-    import mujoco.viewer
-    
     # Generate random morphology
     logger.info("Generating random morphology")
     morphology = Morphology()
     
     # Print the structure for debugging
     logger.info("Morphology structure:")
-    
-    def print_link_structure(link, depth=0):
-        indent = "  " * depth
-        if link.name != "base":
-            logger.info(f"{indent}- {link.name}: length={link.length}, radius={link.radius}")
-        if link.child:
-            print_link_structure(link.child, depth + 1)
-    
     print_link_structure(morphology.base)
     
     # Convert to MJCF
@@ -356,6 +381,10 @@ def test_vis():
         logger.info(f"Setting initial control values for {model.nu} joints")
         for i in range(model.nu):
             data.ctrl[i] = 0.3 * np.sin(i * 0.7)
+
+    links_chain = morphology._get_links_chain(morphology.base)
+    end_effector = links_chain[-1]
+    end_effector_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, end_effector.name)
     
     # Visualize
     with mujoco.viewer.launch_passive(model=model, data=data) as viewer:
@@ -383,6 +412,31 @@ def test_vis():
             # Update simulation time
             sim_time += model.opt.timestep
 
+            # Print positions of all links in the chain
+            print("\nLink tip positions:")
+            for i, link in enumerate(links_chain):
+                if link.name == "base":
+                    continue  # Skip the base link
+                
+                # Calculate tip position using the mujoco_fk function
+                calculated_tip_pos = mujoco_fk(data, model, link)
+                
+                # For all links except the last one, validate against next link's root
+                if i < len(links_chain) - 1 and links_chain[i+1].name != "base":
+                    # Get next link's root position
+                    next_link_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, links_chain[i+1].name)
+                    next_link_root_pos = data.xpos[next_link_id].copy()
+                    
+                    # Calculate distance between calculated tip and next link's root
+                    distance = np.linalg.norm(calculated_tip_pos - next_link_root_pos)
+                    
+                    print(f"{link.name} tip (calculated): {calculated_tip_pos}")
+                    print(f"{link.name} tip (next link root): {next_link_root_pos}")
+                    print(f"{link.name} validation distance: {distance:.6f}")
+                else:
+                    # For the last link, just print the calculated tip position
+                    print(f"{link.name} tip: {calculated_tip_pos}")
+
             import time
             time.sleep(0.2)
             
@@ -392,5 +446,5 @@ def test_vis():
                 break
 
 if __name__ == "__main__":
-    # test_vis()
-    print(test_fk())
+    test_vis()
+    # print(test_fk())
