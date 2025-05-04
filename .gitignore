@@ -1,3 +1,4 @@
 robot_env/
 **/__pycache__
-logs/
+**/logs/
+morph_embed.egg-info

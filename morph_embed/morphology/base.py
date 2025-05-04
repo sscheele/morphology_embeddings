@@ -2,10 +2,13 @@ import numpy as np
 from lxml import etree
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
-from setup_logger import logger
+from morph_embed.setup_logger import logger
+from morph_embed.morphology.mjcf_builder import MJCFBuilder
 
 import mujoco
 import mujoco.viewer
+
+LINK_RADIUS = 0.03
 
 @dataclass
 class Joint:
@@ -22,8 +25,8 @@ class Link:
     child: Optional['Link'] = None
     joint: Optional[Joint] = None
 
-def random_unit_vector():
-    v = np.random.normal(size=3)
+def random_unit_vector(size=3):
+    v = np.random.uniform(size=size)
     return v / np.linalg.norm(v)
 
 def random_rotation_quat():
@@ -35,7 +38,6 @@ def random_rotation_quat():
 class Morphology:
     # Class attributes for morphology parameters
     num_links_range = (3, 7)  # Range for number of links in the chain
-    radius_range = (0.01, 0.03)
     length_range = (0.1, 0.3)
 
     def __init__(self, params=None):
@@ -62,7 +64,7 @@ class Morphology:
         num_links = np.random.randint(*self.num_links_range)
         for i in range(num_links):
             length = np.random.uniform(*self.length_range)
-            radius = np.random.uniform(*self.radius_range)
+            radius = LINK_RADIUS
             
             # Create joint and link
             joint = Joint(
@@ -114,111 +116,26 @@ class Morphology:
             current = current.child
         return links
 
-    def to_mjcf(self) -> str:
-        """Convert the morphology to MJCF format string."""
-        def add_link_to_mujoco(parent_elem, link: Link, color_idx=0):
-            """
-            Add a link to the MuJoCo model.
-            
-            In MuJoCo, the kinematic chain works as follows:
-            1. Each body is positioned relative to its parent
-            2. Joints connect a child body to its parent
-            3. The joint is located at the child body's origin
-            4. When a joint rotates, it rotates the child body and all its descendants
-            
-            For a proper kinematic chain:
-            - The base link is attached directly to the worldbody
-            - Each child link is attached to its parent with a joint at the child's origin
-            - Each link's geometry extends from its origin (where the joint is)
-            """
-            
-            if link.name == "base":
-                # Base link is the worldbody
-                body = parent_elem
-            else:
-                # Create a new body for this link
-                # For a proper kinematic chain in MuJoCo:
-                # - Each child body should be positioned at the end of its parent's geometry
-                # - The joint is at the child body's origin
-                # - The child's geometry extends from its origin
-                pos = [0, 0, 0]  # Default position relative to parent
-                
-                # If this is not the first link after base, position it at the end of the parent link
-                if parent_elem.tag != "worldbody":
-                    pos = [0, 0, parent_elem.find(".//geom").get("fromto").split()[-3:]]
-                    pos = [0, 0, float(parent_elem.find(".//geom").get("fromto").split()[-1])]
-                
-                body = etree.SubElement(parent_elem, "body", name=link.name, pos=" ".join(map(str, pos)))
-                
-                # Add joint at the body's origin
-                if link.joint:
-                    axis_str = " ".join(map(str, link.joint.axis))
-                    etree.SubElement(
-                        body,
-                        "joint",
-                        name=link.joint.name,
-                        type=link.joint.type,
-                        axis=axis_str,
-                        limited="true",
-                        range=f"{link.joint.range[0]} {link.joint.range[1]}"
-                    )
-                
-                # Add geometry for this link
-                if link.length > 0:
-                    # Define ROYGBV colors
-                    colors = [
-                        "1 0 0 1",  # Red
-                        "1 0.5 0 1",  # Orange
-                        "1 1 0 1",  # Yellow
-                        "0 1 0 1",  # Green
-                        "0 0 1 1",  # Blue
-                        "0.5 0 0.5 1"  # Violet
-                    ]
-                    color = colors[color_idx % len(colors)]
-                    
-                    # The capsule extends from the joint (0,0,0) along the z-axis
-                    fromto_str = f"0 0 0 0 0 {link.length}"
-                    
-                    logger.debug(f"  Creating capsule for {link.name}:")
-                    logger.debug(f"    fromto: {fromto_str}")
-                    logger.debug(f"    radius: {link.radius}")
-                    etree.SubElement(
-                        body,
-                        "geom",
-                        type="capsule",
-                        fromto=fromto_str,
-                        size=str(link.radius),
-                        rgba=color
-                    )
-            
-            # Add child if it exists
-            if link.child:
-                add_link_to_mujoco(body, link.child, color_idx=color_idx + 1)
-
-        # Create MJCF structure
-        mujoco = etree.Element("mujoco", model="morphology")
-        etree.SubElement(mujoco, "compiler", angle="radian", coordinate="local")
-        worldbody = etree.SubElement(mujoco, "worldbody")
+    def to_mjcf(self, enable_gravity: bool = False) -> str:
+        """
+        Convert the morphology to MJCF format string.
         
-        # Add the morphology tree
-        add_link_to_mujoco(worldbody, self.base)
+        Args:
+            enable_gravity: Whether to enable gravity in the simulation (default: False)
         
-        # Add actuators for all joints
-        actuator_elem = etree.SubElement(mujoco, "actuator")
-        
-        # Collect all joints from the morphology tree
+        Returns:
+            str: The MJCF XML string representing the morphology
+        """        
+        # Get the links chain
         links_chain = self._get_links_chain(self.base)
-        for link in links_chain[1:]:
-            if link.joint:
-                etree.SubElement(
-                    actuator_elem,
-                    "motor",
-                    name=f"motor_{link.joint.name}",
-                    joint=link.joint.name,
-                    gear="1"
-                )
         
-        return etree.tostring(mujoco, pretty_print=True).decode("utf-8")
+        # Use the builder to create the MJCF
+        return MJCFBuilder.build_mjcf(
+            links_chain=links_chain,
+            enable_gravity=enable_gravity,
+            model_name="morphology",
+            prefix=""
+        )
 
     def get_params(self) -> Dict:
         """Get the current parameters of the morphology."""
@@ -250,6 +167,12 @@ class Morphology:
             'links': link_to_dict(self.base),
             **self.params
         }
+
+    def get_end_effector_position(self, model, data) -> np.ndarray:
+        links_chain = self._get_links_chain(self.arm_morphology.base)
+        end_effector = links_chain[-1]
+
+        return mujoco_fk
 
 def quat2mat(quat):
     """Convert quaternion to rotation matrix."""
@@ -322,7 +245,7 @@ def test_fk(num_timesteps: int = 100, control_magnitude: float = 0.1) -> np.ndar
     
     # Convert to MJCF
     logger.info("Converting to MJCF")
-    mjcf_str = morphology.to_mjcf()
+    mjcf_str = morphology.to_mjcf(enable_gravity=False)
     
     # Create MuJoCo model
     logger.info("Creating MuJoCo model")
@@ -363,7 +286,7 @@ def test_vis():
     
     # Convert to MJCF
     logger.info("Converting to MJCF")
-    mjcf_str = morphology.to_mjcf()
+    mjcf_str = morphology.to_mjcf(enable_gravity=False)
     
     # Create MuJoCo model
     logger.info("Creating MuJoCo model")
@@ -444,6 +367,7 @@ def test_vis():
             if data.time > 10.0:
                 logger.info("Exit success")
                 break
+
 
 if __name__ == "__main__":
     test_vis()

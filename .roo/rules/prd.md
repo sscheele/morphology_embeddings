@@ -22,6 +22,8 @@ Random morphology generation: we will assume only revolute joints and rigid link
 
 We gather data on the dynamics of the geometry by initializing it to a random start state with random joint velocities and playing it forward.
 
+Morphology libraries are located in `morph_embed.morphology` and the most notable classes and function can be imported elsewhere as `morph_embed.Morphology`, `morph_embed.BimanualMorphology`, `morph_embed.mujoco_fk`
+
 ## Architecture
 The embedder will implement a constrained attention module in which each joint may only attend to its ancestors in the kinematic tree. We adopt an autoencoder-type architecture with a physics network in the middle. 
 
