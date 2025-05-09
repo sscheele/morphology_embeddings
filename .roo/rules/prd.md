@@ -8,7 +8,7 @@ This is a research project aimed at producing morphology embeddings for robotic 
 The environment is a prefixed conda environment located at {project_root}/robot_env.
 
 # Style
-Log liberally using the `logging` library. Import the `logger` variable from the `setup_logger.py` file and use that as your logger.
+Log important milestones relevant to a user using the `logging` library. Import the `logger` variable from the `setup_logger.py` file and use that as your logger.
 
 We will make liberal use of the `lightning` library to make sure runs and data are reproducible.
 
@@ -25,7 +25,7 @@ We gather data on the dynamics of the geometry by initializing it to a random st
 Morphology libraries are located in `morph_embed.morphology` and the most notable classes and function can be imported elsewhere as `morph_embed.Morphology`, `morph_embed.BimanualMorphology`, `morph_embed.mujoco_fk`
 
 ## Architecture
-The embedder will implement a constrained attention module in which each joint may only attend to its ancestors in the kinematic tree. We adopt an autoencoder-type architecture with a physics network in the middle. 
+The embedder will implement a constrained attention module in which each joint may only attend to its ancestors in the kinematic tree. This will also help the network to distinguish bimanual from single-arm manipulators. We adopt an autoencoder-type architecture with a physics network in the middle. 
 
 ## Training
 Specifically, if we have an encoder network $A$, decoder $A'$, and physics network $F$, every training step will optimize a two-part loss function:

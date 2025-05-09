@@ -1,6 +1,7 @@
 from .base import Morphology, mujoco_fk, Joint, Link
 from .bimanual import BimanualMorphology
 from .mjcf_builder import MJCFBuilder
+from .vectorize import VectorizedMorphology, DefaultMorphologyVectorization
 
 __all__ = [
         "Morphology",
@@ -8,5 +9,7 @@ __all__ = [
         "Joint",
         "Link",
         "BimanualMorphology",
-        "MJCFBuilder"
+        "MJCFBuilder",
+        "VectorizedMorphology",
+        "DefaultMorphologyVectorization"
     ]

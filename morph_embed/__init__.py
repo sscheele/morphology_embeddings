@@ -1,7 +1,9 @@
-from .morphology import Morphology, BimanualMorphology, mujoco_fk
+from .morphology import Morphology, BimanualMorphology, mujoco_fk, VectorizedMorphology, DefaultMorphologyVectorization
 
 __all__ = [
-    "Morphology", 
+    "Morphology",
     "BimanualMorphology",
-    "mujoco_fk"
+    "mujoco_fk",
+    "VectorizedMorphology",
+    "DefaultMorphologyVectorization"
 ]
