@@ -18,7 +18,7 @@ The most important aspects of the approach are the data, architecture, and train
 ## Data
 We will generate data on-the-fly by randomly generating morphologies and running their dynamics through MuJoCo.
 
-Random morphology generation: we will assume only revolute joints and rigid links. Furthermore, joints may only be at the terminus of a link. A morphology may be bimanual, but bimanual morphologies will always be symmetrical (identical arms separated by not more than the length of the longest link).
+Random morphology generation: we will assume only revolute joints and rigid links. Furthermore, joints may only be at the terminus of a link. A morphology may be bimanual, but bimanual morphologies will always be symmetrical (identical arms separated by not more than the length of the longest link). We assume joint-space velocity control.
 
 We gather data on the dynamics of the geometry by initializing it to a random start state with random joint velocities and playing it forward.
 

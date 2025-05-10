@@ -6,8 +6,7 @@ Also an experiment in LLM-driven development.
 WIP
 
 # TODO
-- [ ] LLM wrote some shady code for handling transforms from the phantom root joint, review this
-- [ ] Move positional encoding implementation out of the vectorization class
+- [ ] Add morphology vectorization to training code
 
 PRD reproduced below:
 

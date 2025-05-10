@@ -1,265 +1,402 @@
-import pytorch_lightning as pl
 import torch
+from abc import ABC, abstractmethod
+from morph_embed.morphology.base import Morphology
+from morph_embed.morphology.vectorize import VectorizedMorphology, DefaultMorphologyVectorization
+from morph_embed.setup_logger import logger
+
+import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from typing import Optional, Dict, List, Tuple, Union, Callable
-from enum import Enum
-from morph_embed.morphology import Morphology, BimanualMorphology
-from morph_embed.setup_logger import logger
-import mujoco
+from typing import List, Callable
 
-class TaskType(Enum):
-    AUTOENCODER = "autoencoder"
-    PHYSICS = "physics"
-    MULTI_TASK = "multi_task"
+from typing import Optional, Dict
 
-class MorphologyDataset(Dataset):
-    """Dataset for morphology data generation."""
+class MorphologyTask(ABC):
+    morph: Morphology
+
+    @property
+    @abstractmethod
+    def size(self) -> int:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_sample(self) -> Dict[str, torch.Tensor]:
+        raise NotImplementedError()
+
+class MorphologyAutoencoderTask(MorphologyTask):
+    def __init__(self,
+            vectorizer: VectorizedMorphology,
+            autoencoder_dim: int,
+            other_task: Optional[MorphologyTask]=None):
+        self.morph = vectorizer.morphology
+        self.other_task = other_task
+        self.vectorizer = vectorizer
+        self.autoencoder_dim = autoencoder_dim
     
-    def __init__(
-        self,
-        task_type: TaskType,
-        num_samples: int = 1000,
-        simulation_steps: int = 10,
-        transform: Optional[Callable] = None,
-        bimanual_prob: float = 0.3,
-        cache_size: int = 100
-    ):
+    @property
+    def size(self) -> int:
+        if self.other_task is None:
+            return self.autoencoder_dim
+        return self.autoencoder_dim + self.other_task.size
+
+    def get_sample(self) -> Dict[str, torch.Tensor]:
+        out = self.other_task.get_sample()
+
+        auto_vec = self.vectorizer.vectorize()
+
+        # pad with zeros to hit a consistent input size
+        pad_len = self.autoencoder_dim - auto_vec.size(0)
+
+        if pad_len > 0:
+            auto_vec = torch.cat([auto_vec, torch.zeros(pad_len, dtype=auto_vec.dtype)])
+        
+        out['autoencoder_vec'] = auto_vec
+
+class MorphologyDynamicsTask(MorphologyTask):
+    """
+    MorphologyDynamicsTask challenges the network to learn to predict the robot's future
+    state given its current state and control inputs
+    """
+    
+    def __init__(self,
+                 morphology: Optional[Morphology] = None,
+                 num_timesteps: int = 10,
+                 control_magnitude: float = 0.1,
+                 state_dim: int = 12):
         """
-        Initialize the dataset.
+        Initialize a MorphologyDynamicsTask.
         
         Args:
-            task_type: Type of task (autoencoder, physics, or multi-task)
-            num_samples: Number of samples to generate
-            simulation_steps: Number of simulation steps for each morphology
-            transform: Optional transform to apply to the data
-            bimanual_prob: Probability of generating a bimanual morphology
-            cache_size: Size of the cache for generated samples
+            morphology: Optional morphology to use. If None, a random morphology will be generated
+                       for each sample.
+            num_timesteps: Number of simulation timesteps to run for each sample
+            control_magnitude: Maximum magnitude of random control values
+            state_dim: Dimension of the state vector (position + velocity)
         """
-        self.task_type = task_type
-        self.num_samples = num_samples
-        self.simulation_steps = simulation_steps
-        self.transform = transform
-        self.bimanual_prob = bimanual_prob
-        self.cache_size = cache_size
-        self.cache = {}  # Simple cache for recently generated samples
+        from morph_embed.setup_logger import logger
+        
+        # If no morphology is provided, we'll generate a random one for each sample
+        self.morph = morphology
+        self.num_timesteps = num_timesteps
+        self.control_magnitude = control_magnitude
+        self.state_dim = state_dim
+        
+        logger.info(f"Initialized MorphologyDynamicsTask with num_timesteps={num_timesteps}, "
+                   f"control_magnitude={control_magnitude}")
     
-    def __len__(self) -> int:
-        return self.num_samples
-    
-    def __getitem__(self, idx: int) -> Dict:
+    @property
+    def size(self) -> int:
         """
-        Generate a sample on-the-fly or retrieve from cache.
+        Get the size of the state vector.
         
-        Returns a dictionary with:
-            - morphology: The morphology object
-            - x: Initial state
-            - x_prime: Time derivative of x
-            - x2: Result of MuJoCo dynamics
-            - task_type: Type of task
+        Returns:
+            int: The dimension of the state vector
         """
-        if idx in self.cache:
-            return self.cache[idx]
-        
-        # Generate new sample
-        sample = self._generate_sample(idx)
-        
-        # Update cache (simple LRU strategy)
-        if len(self.cache) >= self.cache_size:
-            # Remove oldest item
-            oldest_key = next(iter(self.cache))
-            del self.cache[oldest_key]
-        
-        self.cache[idx] = sample
-        return sample
+        return self.state_dim
     
-    def _generate_sample(self, idx: int) -> Dict:
-        """Generate a new sample with morphology and dynamics."""
-        # Determine if this should be a bimanual morphology
-        is_bimanual = np.random.random() < self.bimanual_prob
+    def get_sample(self) -> Dict[str, torch.Tensor]:
+        """
+        Generate a sample by simulating the morphology dynamics.
         
-        # Generate morphology
-        if is_bimanual:
-            arm_morphology = Morphology()
-            morphology = BimanualMorphology(arm_morphology=arm_morphology)
-        else:
+        This method:
+        1. Generates a random morphology if one wasn't provided
+        2. Converts it to MJCF format
+        3. Creates a MuJoCo model and data
+        4. Sets random control values
+        5. Simulates the dynamics for a few timesteps
+        6. Returns the initial state, its derivative, and the final state
+        
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing:
+                - x: Initial state tensor
+                - x_prime: Time derivative of the initial state
+                - x2: State after simulation (future state)
+        """
+        import mujoco
+        import numpy as np
+        from morph_embed.setup_logger import logger
+        from morph_embed.morphology.base import Morphology
+        
+        # Generate a random morphology if one wasn't provided
+        if self.morph is None:
             morphology = Morphology()
+        else:
+            morphology = self.morph
+            
+        # Convert to MJCF
+        mjcf_str = morphology.to_mjcf(enable_gravity=False)
         
-        # Convert to MJCF and create MuJoCo model
-        mjcf_str = morphology.to_mjcf(enable_gravity=True)
+        # Create MuJoCo model
         model = mujoco.MjModel.from_xml_string(mjcf_str)
         data = mujoco.MjData(model)
         
         # Set random initial state
         for i in range(model.nq):
-            data.qpos[i] = np.random.uniform(-0.5, 0.5)
-        for i in range(model.nv):
-            data.qvel[i] = np.random.uniform(-0.5, 0.5)
+            # Random joint positions within joint limits
+            if model.jnt_limited[i]:
+                data.qpos[i] = np.random.uniform(model.jnt_range[i, 0], model.jnt_range[i, 1])
+            else:
+                data.qpos[i] = np.random.uniform(-1.0, 1.0)
+                
+        starting_controls = np.random.uniform(-self.control_magnitude, self.control_magnitude, size=model.nu)
         
-        # Get initial state
+        # Set random control values
+        for i in range(model.nu):
+            data.ctrl[i] = starting_controls
+        
+        # Get the initial state
         mujoco.mj_forward(model, data)
-        x = np.concatenate([data.qpos, data.qvel])
         
-        # Compute time derivative (velocity)
-        x_prime = np.concatenate([data.qvel, data.qacc])
+        # Extract the initial state (position and velocity)
+        x_pos = np.zeros(model.nq)
+        x_vel = np.zeros(model.nv)
         
-        # Step simulation to get next state
-        for _ in range(self.simulation_steps):
+        for i in range(model.nq):
+            x_pos[i] = data.qpos[i]
+        
+        for i in range(model.nv):
+            x_vel[i] = data.qvel[i]
+        
+        # Combine position and velocity for the full state
+        x = np.concatenate([x_pos, x_vel])
+        
+        # Get the time derivative (acceleration)
+        x_prime = np.zeros_like(x)
+        x_prime[:model.nq] = x_vel  # Position derivative is velocity
+        x_prime[model.nq:] = data.qacc  # Velocity derivative is acceleration
+        
+        # Run simulation for specified number of timesteps
+        for _ in range(self.num_timesteps):
             mujoco.mj_step(model, data)
         
-        # Get result of dynamics
-        x2 = np.concatenate([data.qpos, data.qvel])
+        # Extract the final state
+        x2_pos = np.zeros(model.nq)
+        x2_vel = np.zeros(model.nv)
         
-        # Create sample dictionary
-        sample = {
-            "morphology": morphology,
-            "x": torch.tensor(x, dtype=torch.float32),
-            "x_prime": torch.tensor(x_prime, dtype=torch.float32),
-            "x2": torch.tensor(x2, dtype=torch.float32),
-            "task_type": self.task_type
+        for i in range(model.nq):
+            x2_pos[i] = data.qpos[i]
+        
+        for i in range(model.nv):
+            x2_vel[i] = data.qvel[i]
+        
+        # Combine position and velocity for the full final state
+        x2 = np.concatenate([x2_pos, x2_vel])
+        
+        # Pad or truncate to match the expected state dimension
+        if len(x) < self.state_dim:
+            x = np.pad(x, (0, self.state_dim - len(x)))
+            x_prime = np.pad(x_prime, (0, self.state_dim - len(x_prime)))
+            x2 = np.pad(x2, (0, self.state_dim - len(x2)))
+        elif len(x) > self.state_dim:
+            x = x[:self.state_dim]
+            x_prime = x_prime[:self.state_dim]
+            x2 = x2[:self.state_dim]
+        
+        # Convert to PyTorch tensors
+        x_tensor = torch.tensor(x, dtype=torch.float32)
+        x_prime_tensor = torch.tensor(x_prime, dtype=torch.float32)
+        x2_tensor = torch.tensor(x2, dtype=torch.float32)
+        
+        return {
+            "x": x_tensor,
+            "x_prime": x_prime_tensor,
+            "x2": x2_tensor
         }
-        
-        # Apply transform if provided
-        if self.transform:
-            sample = self.transform(sample)
-            
-        return sample
 
-class MorphologyDataModule(pl.LightningDataModule):
-    """Base data module for morphology embeddings."""
+class MorphologyDynamicsAutoencoderDataset(Dataset):
+    """
+    Dataset that generates samples on-the-fly with a new random morphology for each sample.
+    """
+    
+    def __init__(self, num_samples: int, autoencoder_dim: int, state_dim: int,
+                 num_timesteps: int, control_magnitude: float):
+        """
+        Initialize the dataset.
+        
+        Args:
+            num_samples: Number of samples in the dataset
+            autoencoder_dim: Dimension of the autoencoder input/output
+            state_dim: Dimension of the state vector
+            num_timesteps: Number of simulation timesteps
+            control_magnitude: Maximum magnitude of control values
+        """
+        self.num_samples = num_samples
+        self.autoencoder_dim = autoencoder_dim
+        self.state_dim = state_dim
+        self.num_timesteps = num_timesteps
+        self.control_magnitude = control_magnitude
+    
+    def __len__(self) -> int:
+        """
+        Get the number of samples in the dataset.
+        
+        Returns:
+            int: Number of samples
+        """
+        return self.num_samples
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Generate a sample with a new random morphology.
+        
+        Args:
+            idx: Index of the sample (not used, as samples are generated randomly)
+            
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary of tensors for the sample
+        """
+        # Create a new random morphology for each sample
+        morphology = Morphology()
+        vectorizer = DefaultMorphologyVectorization(morphology)
+        
+        # Create dynamics task with the new morphology
+        dynamics_task = MorphologyDynamicsTask(
+            morphology=morphology,
+            num_timesteps=self.num_timesteps,
+            control_magnitude=self.control_magnitude,
+            state_dim=self.state_dim
+        )
+        
+        # Create autoencoder task with the dynamics task
+        autoencoder_task = MorphologyAutoencoderTask(
+            vectorizer=vectorizer,
+            autoencoder_dim=self.autoencoder_dim,
+            other_task=dynamics_task
+        )
+        
+        # Get sample from the combined task
+        return autoencoder_task.get_sample()
+
+class MorphologyDynamicsAutoencoder(pl.LightningDataModule):
+    """
+    LightningDataModule for the morphology dynamics autoencoder task.
+    
+    This data module prepares dataloaders using both the MorphologyAutoencoderTask
+    and MorphologyDynamicsTask classes to train a model that can both autoencode
+    morphology states and predict dynamics. A new random morphology is generated
+    for each sample.
+    """
     
     def __init__(
         self,
         batch_size: int = 32,
         num_workers: int = 4,
-        simulation_steps: int = 10,
-        bimanual_prob: float = 0.3,
-        train_samples: int = 10000,
-        val_samples: int = 1000,
-        test_samples: int = 1000,
-        cache_size: int = 100
+        autoencoder_dim: int = 64,
+        state_dim: int = 12,
+        num_timesteps: int = 10,
+        control_magnitude: float = 0.1,
+        train_samples: int = 1000,
+        val_samples: int = 200,
+        test_samples: int = 200,
     ):
         """
-        Initialize the data module.
+        Initialize the MorphologyDynamicsAutoencoder data module.
         
         Args:
             batch_size: Batch size for dataloaders
             num_workers: Number of workers for dataloaders
-            simulation_steps: Number of simulation steps for each morphology
-            bimanual_prob: Probability of generating a bimanual morphology
+            autoencoder_dim: Dimension of the autoencoder input/output
+            state_dim: Dimension of the state vector (position + velocity)
+            num_timesteps: Number of simulation timesteps to run for each sample
+            control_magnitude: Maximum magnitude of random control values
             train_samples: Number of training samples
             val_samples: Number of validation samples
             test_samples: Number of test samples
-            cache_size: Size of the cache for generated samples
         """
         super().__init__()
+        
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.simulation_steps = simulation_steps
-        self.bimanual_prob = bimanual_prob
+        self.autoencoder_dim = autoencoder_dim
+        self.state_dim = state_dim
+        self.num_timesteps = num_timesteps
+        self.control_magnitude = control_magnitude
         self.train_samples = train_samples
         self.val_samples = val_samples
         self.test_samples = test_samples
-        self.cache_size = cache_size
         
-        self.task_type = None  # To be set by subclasses
-    
-    def prepare_data(self):
-        """Nothing to download or prepare in advance."""
-        pass
+        logger.info(f"Initialized MorphologyDynamicsAutoencoder with batch_size={batch_size}, "
+                   f"autoencoder_dim={autoencoder_dim}, state_dim={state_dim}")
+        
+        # These will be set in setup()
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
     
     def setup(self, stage: Optional[str] = None):
-        """Set up the datasets for each stage."""
-        if stage == "fit" or stage is None:
-            self.train_dataset = self._create_dataset(self.train_samples)
-            self.val_dataset = self._create_dataset(self.val_samples)
+        """
+        Set up the data module by creating datasets.
         
-        if stage == "test" or stage is None:
-            self.test_dataset = self._create_dataset(self.test_samples)
-    
-    def _create_dataset(self, num_samples: int) -> MorphologyDataset:
-        """Create a dataset with the appropriate task type."""
-        if self.task_type is None:
-            raise ValueError("task_type must be set by subclasses")
+        Args:
+            stage: Stage of setup ('fit', 'validate', 'test', or None)
+        """
+        from morph_embed.setup_logger import logger
         
-        return MorphologyDataset(
-            task_type=self.task_type,
-            num_samples=num_samples,
-            simulation_steps=self.simulation_steps,
-            transform=self.transform if hasattr(self, "transform") else None,
-            bimanual_prob=self.bimanual_prob,
-            cache_size=self.cache_size
-        )
+        logger.info(f"Setting up MorphologyDynamicsAutoencoder for stage: {stage}")
+        
+        # Create datasets for each stage
+        if stage == 'fit' or stage is None:
+            self.train_dataset = MorphologyDynamicsAutoencoderDataset(
+                num_samples=self.train_samples,
+                autoencoder_dim=self.autoencoder_dim,
+                state_dim=self.state_dim,
+                num_timesteps=self.num_timesteps,
+                control_magnitude=self.control_magnitude
+            )
+            
+            self.val_dataset = MorphologyDynamicsAutoencoderDataset(
+                num_samples=self.val_samples,
+                autoencoder_dim=self.autoencoder_dim,
+                state_dim=self.state_dim,
+                num_timesteps=self.num_timesteps,
+                control_magnitude=self.control_magnitude
+            )
+        
+        if stage == 'test' or stage is None:
+            self.test_dataset = MorphologyDynamicsAutoencoderDataset(
+                num_samples=self.test_samples,
+                autoencoder_dim=self.autoencoder_dim,
+                state_dim=self.state_dim,
+                num_timesteps=self.num_timesteps,
+                control_magnitude=self.control_magnitude
+            )
     
-    def train_dataloader(self):
+    def train_dataloader(self) -> DataLoader:
+        """
+        Get the training dataloader.
+        
+        Returns:
+            DataLoader: Training dataloader
+        """
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=True
+            shuffle=True
         )
     
-    def val_dataloader(self):
+    def val_dataloader(self) -> DataLoader:
+        """
+        Get the validation dataloader.
+        
+        Returns:
+            DataLoader: Validation dataloader
+        """
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True
+            num_workers=self.num_workers
         )
     
-    def test_dataloader(self):
+    def test_dataloader(self) -> DataLoader:
+        """
+        Get the test dataloader.
+        
+        Returns:
+            DataLoader: Test dataloader
+        """
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True
+            num_workers=self.num_workers
         )
-
-class AutoencoderDataModule(MorphologyDataModule):
-    """Data module focused on the autoencoder reconstruction task."""
-    
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.task_type = TaskType.AUTOENCODER
-        
-        # You could add autoencoder-specific transforms here
-        self.transform = None
-
-class PhysicsDataModule(MorphologyDataModule):
-    """Data module focused on the physics prediction task."""
-    
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.task_type = TaskType.PHYSICS
-        
-        # You could add physics-specific transforms here
-        self.transform = None
-
-class MultiTaskDataModule(MorphologyDataModule):
-    """Data module that handles both autoencoder and physics tasks."""
-    
-    def __init__(self, task_weights: Dict[str, float] = None, **kwargs):
-        """
-        Initialize the multi-task data module.
-        
-        Args:
-            task_weights: Dictionary mapping task names to weights
-            **kwargs: Additional arguments for the base class
-        """
-        super().__init__(**kwargs)
-        self.task_type = TaskType.MULTI_TASK
-        
-        # Default to equal weighting if not specified
-        self.task_weights = task_weights or {
-            "autoencoder": 0.5,
-            "physics": 0.5
-        }
-        
-        # Normalize weights
-        total = sum(self.task_weights.values())
-        self.task_weights = {k: v / total for k, v in self.task_weights.items()}
-        
-        logger.info(f"MultiTaskDataModule initialized with weights: {self.task_weights}")

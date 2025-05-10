@@ -1,9 +1,9 @@
 import torch
 from abc import ABC, abstractmethod
-from typing import Union, Optional
+from typing import Union, Optional, List, Dict
 
 from morph_embed.setup_logger import logger
-from morph_embed.morphology.base import Morphology
+from morph_embed.morphology.base import Morphology, Link
 from morph_embed.morphology.bimanual import BimanualMorphology
 
 

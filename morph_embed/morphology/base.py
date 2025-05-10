@@ -1,7 +1,7 @@
 import numpy as np
 from lxml import etree
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set, Literal
 from morph_embed.setup_logger import logger
 from morph_embed.morphology.mjcf_builder import MJCFBuilder
 
@@ -13,16 +13,23 @@ LINK_RADIUS = 0.03
 @dataclass
 class Joint:
     name: str
+
+@dataclass
+class HingeJoint(Joint):
     axis: np.ndarray
     range: Tuple[float, float] = (-1.57, 1.57)
-    type: str = "hinge"
+
+@dataclass
+class FixedJoint(Joint):
+    translation: np.ndarray
+    rotation: np.ndarray
 
 @dataclass
 class Link:
     name: str
     length: float
     radius: float
-    child: Optional['Link'] = None
+    children: List['Link'] = field(default_factory=lambda: [])
     joint: Optional[Joint] = None
 
 def random_unit_vector(size=3):
@@ -51,6 +58,9 @@ class Morphology:
                 self._load_morphology(params['links'])
             else:
                 self._generate_random_morphology()
+        
+        # Initialize end_effectors
+        self._compute_end_effectors()
 
     def _generate_random_morphology(self):
         """Generate a random morphology using the current parameters."""
@@ -67,7 +77,7 @@ class Morphology:
             radius = LINK_RADIUS
             
             # Create joint and link
-            joint = Joint(
+            joint = HingeJoint(
                 name=f"j_link_{i}",
                 axis=random_unit_vector()
             )
@@ -79,9 +89,35 @@ class Morphology:
                 joint=joint
             )
             
-            current_link.child = new_link
+            current_link.children = [new_link]
             current_link = new_link
 
+    def _compute_end_effectors(self):
+        """
+        Compute the end effectors for this morphology.
+        
+        For random morphologies, links with no children are considered end effectors.
+        For non-random morphologies loaded from params, end effectors are loaded from params
+        if available, otherwise determined by links with no children.
+        """
+        # Check if end effectors are specified in params
+        if 'end_effectors' in self.params:
+            self.end_effectors = self.params['end_effectors']
+            return
+            
+        # Otherwise, find links with no children
+        self.end_effectors = []
+        
+        def find_end_effectors(link: Link):
+            if len(link.children) == 0 and link.name != "base":
+                self.end_effectors.append(link.name)
+            else:
+                for child in link.children:
+                    find_end_effectors(child)
+        
+        # Start traversal from the base link
+        find_end_effectors(self.base)
+    
     def _load_morphology(self, links_data: Dict):
         """Load a saved morphology from the provided data."""
         def create_link_from_dict(data: Dict) -> Link:
@@ -93,27 +129,35 @@ class Morphology:
             
             if 'joint' in data:
                 joint_data = data['joint']
-                link.joint = Joint(
-                    name=joint_data['name'],
-                    axis=np.array(joint_data['axis']),
-                    range=tuple(joint_data.get('range', (-1.57, 1.57))),
-                    type=joint_data.get('type', 'hinge')
-                )
+                if 'type' not in joint_data or joint_data['type'] == 'hinge':
+                    link.joint = HingeJoint(
+                        name=joint_data['name'],
+                        axis=np.array(joint_data['axis']),
+                        range=tuple(joint_data.get('range', (-1.57, 1.57)))
+                    )
+                elif joint_data['type'] == 'fixed':
+                    link.joint = FixedJoint(
+                        name=joint_data['name'],
+                        translation=joint_data['translation'],
+                        rotation=joint_data['rotation']
+                    )
             
-            if 'child' in data:
-                link.child = create_link_from_dict(data['child'])
+            if 'children' in data:
+                link.children = create_link_from_dict(data['children'])
             
             return link
         
         self.base = create_link_from_dict(links_data)
     
-    def _get_links_chain(self, start_link: Link) -> List[Link]:
-        """Get a list of all links in the chain starting from the given link."""
+    @staticmethod
+    def _get_links_chain(start_link: Link) -> List[Link]:
+        """Flattens the link tree via depth-first traversal"""
         links = [start_link]
-        current = start_link
-        while current.child:
-            links.append(current.child)
-            current = current.child
+        if len(start_link.children) == 0:
+            return links
+
+        for c in start_link.children:
+            links += Morphology._get_links_chain(c)
         return links
 
     def to_mjcf(self, enable_gravity: bool = False) -> str:
@@ -158,21 +202,20 @@ class Morphology:
                     'type': link.joint.type
                 }
             
-            if link.child:
-                data['child'] = link_to_dict(link.child)
+            if len(link.children) > 0:
+                data['children'] = [link_to_dict(c) for c in link.children]
+            else:
+                data['children'] = []
             
             return data
         
-        return {
+        # Include end effectors in the dictionary representation
+        result = {
             'links': link_to_dict(self.base),
-            **self.params
+            'end_effectors': self.end_effectors
         }
-
-    def get_end_effector_position(self, model, data) -> np.ndarray:
-        links_chain = self._get_links_chain(self.arm_morphology.base)
-        end_effector = links_chain[-1]
-
-        return mujoco_fk
+            
+        return result
 
 def quat2mat(quat):
     """Convert quaternion to rotation matrix."""
@@ -213,8 +256,9 @@ def print_link_structure(link, depth=0):
     indent = "  " * depth
     if link.name != "base":
         logger.info(f"{indent}- {link.name}: length={link.length}, radius={link.radius}")
-    if link.child:
-        print_link_structure(link.child, depth + 1)
+    if len(link.children) > 0:
+        for c in link.children:
+            print_link_structure(c, depth + 1)
 
 def test_fk(num_timesteps: int = 100, control_magnitude: float = 0.1) -> np.ndarray:
     """
@@ -299,11 +343,11 @@ def test_vis():
         # Set small sinusoidal control values based on joint index
         for i in range(model.nu):
             # Different frequencies and phases for varied movement
-            data.ctrl[i] = 0.3 * np.sin(i * 0.7)
+            data.ctrl[i] = 0.5 * np.sin(i * 0.7)
     else:
         logger.info(f"Setting initial control values for {model.nu} joints")
         for i in range(model.nu):
-            data.ctrl[i] = 0.3 * np.sin(i * 0.7)
+            data.ctrl[i] = 0.5 * np.sin(i * 0.7)
 
     links_chain = morphology._get_links_chain(morphology.base)
     end_effector = links_chain[-1]
@@ -324,7 +368,7 @@ def test_vis():
             # Update control values over time for continuous movement
             for i in range(model.nu):
                 # Create oscillating control values with different frequencies
-                data.ctrl[i] = 0.3 * np.sin(sim_time * 2.0 + i * 0.7)
+                data.ctrl[i] = 0.5 * np.sin(sim_time * 2.0 + i * 0.7)
             
             # Step the simulation
             mujoco.mj_step(model, data)

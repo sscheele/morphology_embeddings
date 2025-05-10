@@ -78,20 +78,70 @@ class MJCFBuilder:
                 if geom_elem is not None and geom_elem.get("fromto") is not None:
                     pos = [0, 0, float(geom_elem.get("fromto").split()[-1])]
             
-            body = etree.SubElement(parent_elem, "body", name=f"{prefix}{link.name}", pos=" ".join(map(str, pos)))
+            # Create body
+            body = etree.SubElement(
+                parent_elem,
+                "body",
+                name=f"{prefix}{link.name}",
+                pos=" ".join(map(str, pos))
+            )
+            
+            # Calculate mass based on link dimensions (assuming cylindrical shape)
+            # Use a reasonable density (1000 kg/m³, similar to water)
+            density = 1000.0
+            if link.length > 0 and link.radius > 0:
+                # Volume of a cylinder: π * r² * h
+                volume = np.pi * (link.radius ** 2) * link.length
+                mass = density * volume
+            else:
+                # Default mass for links with no dimensions
+                mass = 1.0
+            
+            # For a cylinder along z-axis, the inertia tensor is:
+            # Ixx = Iyy = m/12 * (3r² + h²)
+            # Izz = m/2 * r²
+            if link.length > 0 and link.radius > 0:
+                ixx = iyy = mass/12.0 * (3.0 * link.radius**2 + link.length**2)
+                izz = mass/2.0 * link.radius**2
+            else:
+                # Default inertia for links with no dimensions
+                ixx = iyy = izz = 0.1
+            
+            # Add inertial element
+            inertial = etree.SubElement(body, "inertial")
+            inertial.set("pos", "0 0 0")  # Center of mass at origin
+            inertial.set("mass", str(mass))
+            inertial.set("diaginertia", f"{ixx} {iyy} {izz}")
             
             # Add joint at the body's origin
             if link.joint:
-                axis_str = " ".join(map(str, link.joint.axis))
-                etree.SubElement(
-                    body,
-                    "joint",
-                    name=f"{prefix}{link.joint.name}",
-                    type=link.joint.type,
-                    axis=axis_str,
-                    limited="true",
-                    range=f"{link.joint.range[0]} {link.joint.range[1]}"
-                )
+                if hasattr(link.joint, 'axis') and hasattr(link.joint, 'range'):
+                    # This is a HingeJoint
+                    axis_str = " ".join(map(str, link.joint.axis))
+                    etree.SubElement(
+                        body,
+                        "joint",
+                        name=f"{prefix}{link.joint.name}",
+                        type="hinge",
+                        axis=axis_str,
+                        limited="true",
+                        range=f"{link.joint.range[0]} {link.joint.range[1]}",
+                        damping="0.2"
+                    )
+                elif hasattr(link.joint, 'translation') and hasattr(link.joint, 'rotation'):
+                    # This is a FixedJoint
+                    # For FixedJoint, we don't add a joint element but instead set the position and orientation
+                    # of the body element based on the translation and rotation properties
+                    
+                    # Update the body position with the translation
+                    trans_str = " ".join(map(str, link.joint.translation))
+                    body.set("pos", trans_str)
+                    
+                    # Update the body orientation with the rotation (quaternion)
+                    rot_str = " ".join(map(str, link.joint.rotation))
+                    body.set("quat", rot_str)
+                    
+                    logger.info(f"Added FixedJoint for {prefix}{link.name} with translation {trans_str} and rotation {rot_str}")
             
             # Add geometry for this link
             if link.length > 0:
@@ -122,9 +172,10 @@ class MJCFBuilder:
                 )
         
         # Add child if it exists
-        if link.child:
-            MJCFBuilder.add_link_to_mujoco(body, link.child, prefix, color_idx=color_idx + 1, 
-                                          rotation=None, translation=None)
+        if len(link.children) > 0:
+            for c in link.children:
+                MJCFBuilder.add_link_to_mujoco(body, c, prefix, color_idx=color_idx + 1, 
+                                            rotation=None, translation=None)
         
         return body
     
@@ -134,7 +185,9 @@ class MJCFBuilder:
         actuator_elem = etree.SubElement(mjcf_root, "actuator")
         
         for link in links_chain[1:]:  # Skip the base link
-            if link.joint:
+            if link.joint and hasattr(link.joint, 'axis') and hasattr(link.joint, 'range'):
+                # Only add actuators for HingeJoint, not for FixedJoint
+                logger.info(f"Adding actuator for joint: {prefix}{link.joint.name}")
                 etree.SubElement(
                     actuator_elem,
                     "motor",
