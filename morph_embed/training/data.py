@@ -4,7 +4,7 @@ from morph_embed.morphology.base import Morphology
 from morph_embed.morphology.vectorize import VectorizedMorphology, DefaultMorphologyVectorization
 from morph_embed.setup_logger import logger
 
-import pytorch_lightning as pl
+import lightning as pl
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from typing import List, Callable
@@ -46,11 +46,13 @@ class MorphologyAutoencoderTask(MorphologyTask):
 
         # pad with zeros to hit a consistent input size
         pad_len = self.autoencoder_dim - auto_vec.size(0)
+        print(f"Adding {pad_len} zeros")
 
         if pad_len > 0:
             auto_vec = torch.cat([auto_vec, torch.zeros(pad_len, dtype=auto_vec.dtype)])
         
         out['autoencoder_vec'] = auto_vec
+        return out
 
 class MorphologyDynamicsTask(MorphologyTask):
     """
@@ -142,7 +144,7 @@ class MorphologyDynamicsTask(MorphologyTask):
         
         # Set random control values
         for i in range(model.nu):
-            data.ctrl[i] = starting_controls
+            data.ctrl[i] = starting_controls[i]
         
         # Get the initial state
         mujoco.mj_forward(model, data)
@@ -281,7 +283,7 @@ class MorphologyDynamicsAutoencoder(pl.LightningDataModule):
         self,
         batch_size: int = 32,
         num_workers: int = 4,
-        autoencoder_dim: int = 64,
+        autoencoder_dim: int = 128,
         state_dim: int = 12,
         num_timesteps: int = 10,
         control_magnitude: float = 0.1,
@@ -400,3 +402,10 @@ class MorphologyDynamicsAutoencoder(pl.LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers
         )
+
+if __name__ == "__main__":
+    ldm = MorphologyDynamicsAutoencoder()
+    ldm.setup()
+    # print(next(iter(ldm.train_dataset)))
+    train_dl = ldm.train_dataloader()
+    print(next(iter(train_dl)))

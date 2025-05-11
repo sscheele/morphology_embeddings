@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from typing import Union, Optional, List, Dict
 
 from morph_embed.setup_logger import logger
-from morph_embed.morphology.base import Morphology, Link
+from morph_embed.morphology.base import Morphology, Link, HingeJoint, FixedJoint
 from morph_embed.morphology.bimanual import BimanualMorphology
 
 
@@ -184,7 +184,7 @@ class DefaultMorphologyVectorization(VectorizedMorphology):
                 radius=link.radius,
                 joint=link.joint
             )
-            current_link.child = new_link
+            current_link.children = [new_link]
             current_link = new_link
         
         # Second arm
@@ -211,26 +211,18 @@ class DefaultMorphologyVectorization(VectorizedMorphology):
                 radius=link.radius,
                 joint=link.joint
             )
-            current_link.child = new_link
+            current_link.children = [new_link]
             current_link = new_link
         
         # Connect both arms to the root
-        root_link.child = first_arm_base
-        
-        # Find the last link of the first arm
-        last_link = first_arm_base
-        while last_link.child:
-            last_link = last_link.child
-        
-        # Connect the second arm after the first arm
-        last_link.child = second_arm_base
+        root_link.children = [first_arm_base, second_arm_base]
         
         # Build the complete chain
         return [root_link] + self._get_all_children(root_link)
     
     def _get_all_children(self, link: Link) -> List[Link]:
         """
-        Get all children of a link recursively.
+        Get all children of a link recursively using depth-first traversal.
         
         Args:
             link: The starting link
@@ -239,11 +231,10 @@ class DefaultMorphologyVectorization(VectorizedMorphology):
             List[Link]: A list of all child links
         """
         result = []
-        current = link.child
         
-        while current:
-            result.append(current)
-            current = current.child
+        for child in link.children:
+            result.append(child)
+            result.extend(self._get_all_children(child))
             
         return result
     
@@ -262,7 +253,7 @@ class DefaultMorphologyVectorization(VectorizedMorphology):
             else:
                 # Find the parent link
                 for j, potential_parent in enumerate(self.links):
-                    if potential_parent.child and potential_parent.child.name == link.name:
+                    if hasattr(potential_parent, 'children') and link in potential_parent.children:
                         parent_indices[i] = j
                         break
         
@@ -357,12 +348,12 @@ class DefaultMorphologyVectorization(VectorizedMorphology):
             vector[start_idx+6:start_idx+6+self.positional_encoding_dim] = pos_encoding
             
             # 4. End-effector flag (1D)
-            if link.child is None:
+            if len(link.children) == 0:
                 vector[start_idx+6+self.positional_encoding_dim] = 1.0
             
             # 5. Joint type (one-hot, 2D)
             if link.joint:
-                if link.joint.type == "fixed":
+                if isinstance(link.joint, FixedJoint):
                     vector[start_idx+6+self.positional_encoding_dim+1] = 1.0
                 else:  # "hinge" or other rotational joint
                     vector[start_idx+6+self.positional_encoding_dim+2] = 1.0
