@@ -48,8 +48,10 @@ We will handle bimanual robots by adding a root point halfway between the two ar
 The embedder will implement a constrained attention module in which each joint may only attend to its ancestors in the kinematic tree. We adopt an autoencoder-type architecture with a physics network in the middle. 
 
 ## Training
-Specifically, if we have an encoder network $A$, decoder $A'$, and physics network $F$, every training step will optimize a two-part loss function:
+We'll aim for curriculum learning of some sort with a number of ancillary losses. To start out, we'll train autoencoder+forward kinematics. The full loss function will be a linear combination of the autoencoder and FK losses. We want the autoencoder to learn to encode _both_ morphology and state because both are relevant to tasks we might want to accomplish in the compressed state space.
 
-$$\alpha ||[x, x'] - A'(A(x, x'))||^2 + \beta ||x_2 - A'(F(A(x, x')))||^2$$
+If we have an oracle function `fk` which we're trying to approximate with network `F`, and the autoencoder and decoder are `A` and `A'`, then the loss would be:
 
-Where x' is the time derivative of x and x_2 is the result of the MuJoCo dynamics
+$$\alpha ||A'(A(M, x, x')) - [M, x, x']||^2 - \beta ||F(A(M, x, x')) - fk(x, M)||^2$$
+
+Where $x$ is the state and $M$ is the morphology.
